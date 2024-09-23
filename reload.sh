@@ -37,4 +37,3 @@ else
     do_exit
 fi
 
-sudo ./data_generator test.txt

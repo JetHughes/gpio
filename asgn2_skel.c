@@ -12,15 +12,22 @@
 #include <linux/sched.h>
 #include <linux/wait.h>
 #include <linux/circ_buf.h>
-#include "gpio.c"  // Include your GPIO-related code
+#include "gpio.c"
 
 #define MYDEV_NAME "asgn2"
 #define PAGE_QUEUE_SIZE 16
-#define CIRCULAR_BUFFER_SIZE 1024  // Size of the circular buffer
+#define CIRCULAR_BUFFER_SIZE 1024
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jet Hughes");
 MODULE_DESCRIPTION("COSC440 asgn2");
+
+struct page_node {
+    struct page *page;
+    size_t head_offset; // Read offset
+    size_t tail_offset; // Write offset
+    struct list_head list; // Kernel's linked list structure
+};
 
 /**
  * Circular buffer structure
@@ -29,7 +36,7 @@ struct circ_buffer {
     char buffer[CIRCULAR_BUFFER_SIZE];
     int head;
     int tail;
-    spinlock_t lock;  // Spinlock to protect the circular buffer
+    spinlock_t lock;
 };
 
 struct circ_buffer circ_buf;
@@ -38,25 +45,23 @@ struct circ_buffer circ_buf;
  * Page queue structure (for multiple-page buffering)
  */
 typedef struct page_queue_t {
-    struct page *pages[PAGE_QUEUE_SIZE];  // Array of pages
-    int head;   // Index to the next page to be read
-    int tail;   // Index to the next page to be written
-    int head_offset;
-    int tail_offset;
+    struct list_head pages; // Linked list head
+    spinlock_t lock; // Lock for the queue
+    int data_size;
 } page_queue;
 
-page_queue buffer_queue;  // Declare the buffer queue globally
-struct tasklet_struct my_tasklet;  // Tasklet declaration
+page_queue buffer_queue;
+struct tasklet_struct my_tasklet;
 
-dev_t dev_num;  // Device number
+dev_t dev_num;
 struct cdev *asgn2_cdev;
 struct class *asgn2_class;
 struct device *asgn2_device;
-spinlock_t queue_lock;  // Spinlock for page queue synchronization
 
-wait_queue_head_t read_queue;  // Wait queue for blocking readers
-static bool session_complete = false;   // Bool to ensure device is closed after each session is fully read
-atomic_t nprocs;  // Number of processes currently accessing the device
+spinlock_t queue_lock;
+wait_queue_head_t read_queue;
+static bool session_complete = false;
+atomic_t nprocs;
 
 /**
  * Initialize the circular buffer
@@ -64,10 +69,21 @@ atomic_t nprocs;  // Number of processes currently accessing the device
 int init_circular_buffer(void) {
     circ_buf.head = 0;
     circ_buf.tail = 0;
-    spin_lock_init(&circ_buf.lock);  // Initialize the spinlock
+    spin_lock_init(&circ_buf.lock);
     printk(KERN_INFO "asgn2: Circular buffer initialized\n");
     return 0;
 }
+
+/**
+ * Initialize the page queue
+ */
+void init_page_queue(void) {
+    buffer_queue.data_size = 0;
+    INIT_LIST_HEAD(&buffer_queue.pages);
+    spin_lock_init(&buffer_queue.lock);
+    printk(KERN_INFO "asgn2: Page queue initialized\n");
+}
+
 
 /**
  * Write a byte to the circular buffer
@@ -76,6 +92,7 @@ int circ_buf_write(char data) {
     unsigned long flags;
     spin_lock_irqsave(&circ_buf.lock, flags);
     
+    // If there is no space drop the byte
     if (CIRC_SPACE(circ_buf.head, circ_buf.tail, CIRCULAR_BUFFER_SIZE) == 0) {
         spin_unlock_irqrestore(&circ_buf.lock, flags);
         printk(KERN_ERR "asgn2: Circular buffer is full, dropping byte\n");
@@ -109,58 +126,73 @@ int circ_buf_read(char *data) {
     return 0;
 }
 
-/**
- * Initialize the page queue
- */
-void init_page_queue(void) {
-    buffer_queue.head = 0;
-    buffer_queue.tail = 0;
-    buffer_queue.head_offset = 0;
-    buffer_queue.tail_offset = 0;
-    printk(KERN_INFO "asgn2: Page queue initialized\n");
+struct page_node* alloc_new_page_node(void) {
+    struct page_node *new_node = kmalloc(sizeof(*new_node), GFP_KERNEL);
+    if (!new_node) {
+        printk(KERN_ERR "Failed to allocate memory for page node\n");
+        return NULL;
+    }
+
+    new_node->page = alloc_page(GFP_KERNEL);
+    if (!new_node->page) {
+        printk(KERN_ERR "Failed to allocate new page\n");
+        kfree(new_node);
+        return NULL;
+    }
+
+    new_node->head_offset = 0;
+    new_node->tail_offset = 0;
+    INIT_LIST_HEAD(&new_node->list);
+
+    return new_node;
 }
+
 
 /**
  * Add a byte to the page queue (used by the tasklet)
  */
 void add_to_page_queue(char byte) {
     unsigned long flags;
-    struct page *page;
+    struct page_node *tail_node;
 
-    spin_lock_irqsave(&queue_lock, flags);
+    spin_lock_irqsave(&buffer_queue.lock, flags);
 
-    // Check if the current page is full or if it's the first write
-    if (!buffer_queue.pages[buffer_queue.tail] || buffer_queue.tail_offset >= PAGE_SIZE) {
-        page = alloc_page(GFP_KERNEL);
-        if (!page) {
-            printk(KERN_ERR "Failed to allocate new page\n");
-            spin_unlock_irqrestore(&queue_lock, flags);
+    // Check if the list is empty or the last node's page is full
+    if (list_empty(&buffer_queue.pages)) {
+        // List is empty, allocate a new node
+        tail_node = alloc_new_page_node();
+        if (!tail_node) {
+            spin_unlock_irqrestore(&buffer_queue.lock, flags);
             return;
         }
-
-        buffer_queue.pages[buffer_queue.tail] = page;
-        buffer_queue.tail_offset = 0;
-        printk(KERN_INFO "asgn2: Allocated new page at tail %d\n", buffer_queue.tail);
+        list_add_tail(&tail_node->list, &buffer_queue.pages);
     } else {
-        page = buffer_queue.pages[buffer_queue.tail];
+        // Get the last node in the list
+        tail_node = list_last_entry(&buffer_queue.pages, struct page_node, list);
+        
+        // Check if the current page is full
+        if (tail_node->tail_offset >= PAGE_SIZE) {
+            // Allocate a new node since the current page is full
+            tail_node = alloc_new_page_node();
+            if (!tail_node) {
+                spin_unlock_irqrestore(&buffer_queue.lock, flags);
+                return;
+            }
+            list_add_tail(&tail_node->list, &buffer_queue.pages);
+        }
     }
 
     // Add byte to the page at the current offset
-    void *page_addr = page_address(page);
-    ((char *)page_addr)[buffer_queue.tail_offset] = byte;
-    printk(KERN_INFO "asgn2: Byte 0x%x added at page offset %d\n", byte, buffer_queue.tail_offset);
+    void *page_addr = page_address(tail_node->page);
+    ((char *)page_addr)[tail_node->tail_offset] = byte;
+    tail_node->tail_offset++;
+    buffer_queue.data_size++;
 
-    buffer_queue.tail_offset++;
+    printk(KERN_INFO "asgn2: Byte 0x%x added at page offset %d\n", byte, tail_node->tail_offset);
 
-    // Move to the next page slot if full
-    if (buffer_queue.tail_offset >= PAGE_SIZE) {
-        buffer_queue.tail = (buffer_queue.tail + 1) % PAGE_QUEUE_SIZE;
-        buffer_queue.tail_offset = 0;  // Reset offset for the new page
-        printk(KERN_INFO "asgn2: Page full, moving to next page tail %d\n", buffer_queue.tail);
-    }
-
-    spin_unlock_irqrestore(&queue_lock, flags);
+    spin_unlock_irqrestore(&buffer_queue.lock, flags);
 }
+
 
 /**
  * Tasklet function: Process the circular buffer and add to the page queue
@@ -174,6 +206,7 @@ void bottom_half_tasklet_function(unsigned long data) {
     printk(KERN_INFO "asgn2: Tasklet processed circular buffer and added bytes to page queue\n");
     wake_up_interruptible(&read_queue);  // Wake up any readers waiting for data
 }
+
 
 /**
  * Interrupt handler: Handle half-bytes, assemble into full byte, and push to circular buffer
@@ -204,17 +237,13 @@ irqreturn_t dummyport_interrupt(int irq, void *dev_id) {
     return IRQ_HANDLED;
 }
 
-bool page_queue_is_empty(void){
-    return (buffer_queue.head == buffer_queue.tail && buffer_queue.head_offset == buffer_queue.tail_offset);
-}
-
 /**
  * Read function: Consume data from the page queue
  */
 ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
     unsigned long flags;
     size_t bytes_read = 0;
-    struct page *page;
+    struct page_node *node, *tmp;
 
     if (session_complete) {
         printk(KERN_INFO "asgn2: Session already completed, blocking further reads\n");
@@ -222,79 +251,70 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count, loff_t *f_
     }
 
     printk(KERN_INFO "asgn2: Read request for %zu bytes\n", count);
+    printk(KERN_INFO "asgn2: I have %d bytes of data", buffer_queue.data_size);
 
-    // Wait if no data is available
-    if (page_queue_is_empty()) {
+    if (list_empty(&buffer_queue.pages)) {
         printk(KERN_INFO "asgn2: No data in page queue, waiting for data\n");
     }
-    wait_event_interruptible(read_queue, !page_queue_is_empty());
 
-    printk(KERN_INFO "asgn2: Woken up from sleep, head = %d + %d, tail = %d + %d\n", buffer_queue.head, buffer_queue.head_offset, buffer_queue.tail, buffer_queue.tail_offset);
+    // Wait if no data is available
+    wait_event_interruptible(read_queue, !list_empty(&buffer_queue.pages));
 
-    spin_lock_irqsave(&queue_lock, flags);
+    printk(KERN_INFO "asgn2: Woken up from sleep. I have %d bytes of data", buffer_queue.data_size);
 
-    while (bytes_read < count && !page_queue_is_empty()) {
-        page = buffer_queue.pages[buffer_queue.head];
-        
-        size_t available_in_page;
+    spin_lock_irqsave(&buffer_queue.lock, flags);
 
-        if (buffer_queue.head == buffer_queue.tail) {
-            // If head equals tail, we can only read up to tail_offset
-            available_in_page = buffer_queue.tail_offset - buffer_queue.head_offset;
-        } else {
-            // Otherwise, we can read the remainder of the page
-            available_in_page = PAGE_SIZE - buffer_queue.head_offset;
-        }
+    int page_number = 0;
+    list_for_each_entry_safe(node, tmp, &buffer_queue.pages, list) {
+        size_t available = node->tail_offset - node->head_offset;
+        size_t to_read = min(available, count - bytes_read);
+        void *page_addr = page_address(node->page);
 
-        printk(KERN_INFO "%zu bytes available", available_in_page);
-
-        size_t to_read = min(available_in_page, count - bytes_read);
-        void *page_addr = page_address(page);
+        printk(KERN_INFO "Reading node %d, %zu bytes available, reading %zu bytes", page_number, available, to_read);
 
         // Check for NULL character before reading
-        for (size_t i = 0; i < to_read; i++) {
-            char byte = ((char *)page_addr)[buffer_queue.head_offset + i];
+        size_t i;
+        for (i = 0; i < to_read; i++) {
+            char byte = ((char *)page_addr)[node->head_offset + i];
             if (byte == '\0') {
                 session_complete = true;  // Mark session as complete
-                printk(KERN_INFO "asgn2: NULL character encountered, session complete\n");
                 to_read = i;  // Stop reading before the NULL character
+                printk(KERN_INFO "Found null after %zu bytes", i);
                 break;
             }
         }
 
-        printk(KERN_INFO "asgn2: Reading from page %d, offset %d, reading %zu bytes\n",
-               buffer_queue.head, buffer_queue.head_offset, to_read);
-
-        if (copy_to_user(buf + bytes_read, page_addr + buffer_queue.head_offset, to_read)) {
-            spin_unlock_irqrestore(&queue_lock, flags);
+        if (copy_to_user(buf + bytes_read, page_addr + node->head_offset, to_read)) {
+            spin_unlock_irqrestore(&buffer_queue.lock, flags);
             printk(KERN_ERR "asgn2: Failed to copy data to user space\n");
             return -EFAULT;
         }
 
-        buffer_queue.head_offset += to_read;
+        buffer_queue.data_size -= session_complete ? to_read+1 : to_read;
+        node->head_offset += session_complete ? to_read+1 : to_read;
         bytes_read += to_read;
 
-        if (buffer_queue.head_offset >= PAGE_SIZE) {
-            printk(KERN_INFO "asgn2: Page %d fully read, freeing page\n", buffer_queue.head);
-            __free_page(buffer_queue.pages[buffer_queue.head]);
-            buffer_queue.pages[buffer_queue.head] = NULL;
-            buffer_queue.head = (buffer_queue.head + 1) % PAGE_QUEUE_SIZE;
-            buffer_queue.head_offset = 0;
-            printk(KERN_INFO "asgn2: Moved to next page, head = %d, head_offset reset to 0\n", buffer_queue.head);
+        if (node->head_offset >= node->tail_offset) {
+            // We've read all data from this node or session is complete
+            printk(KERN_INFO "read all data, freeing page");
+            list_del(&node->list);
+            __free_page(node->page);
+            buffer_queue.data_size -= PAGE_SIZE;
+            kfree(node);
         }
 
-        if (session_complete) {
+        if (bytes_read >= count || session_complete) {
             break;
         }
-
-        printk(KERN_INFO "asgn2: %zu bytes read so far\n", bytes_read);
+        page_number++;
     }
 
-    spin_unlock_irqrestore(&queue_lock, flags);
+    spin_unlock_irqrestore(&buffer_queue.lock, flags);
 
     printk(KERN_INFO "asgn2: Read completed, %zu bytes read\n", bytes_read);
     return bytes_read;
 }
+
 
 /**
  * Open function: Ensure only one reader is allowed
@@ -382,15 +402,7 @@ static int __init asgn2_init_module(void) {
     tasklet_init(&my_tasklet, bottom_half_tasklet_function, 0);
     printk(KERN_INFO "asgn2: Tasklet initialized\n");
 
-    // // Request IRQ for GPIO
-    // result = request_irq(dummy_irq, dummyport_interrupt, IRQF_TRIGGER_RISING | IRQF_ONESHOT, "gpio27", NULL);
-    // if (result) {
-    //     printk(KERN_ERR "asgn2: Failed to request IRQ\n");
-    //     goto fail_device;
-    // }
-    // printk(KERN_INFO "asgn2: IRQ requested successfully\n");
-
-    atomic_set(&nprocs, 0);  // Initialize process count
+    atomic_set(&nprocs, 0);
 
     printk(KERN_INFO "asgn2: Module loaded\n");
     return 0;
@@ -410,6 +422,19 @@ fail_chrdev:
  * Module cleanup function
  */
 static void __exit asgn2_exit_module(void) {
+    struct page_node *node, *tmp;
+    unsigned long flags;
+
+    spin_lock_irqsave(&buffer_queue.lock, flags);
+
+    // Free all pages in page queue
+    list_for_each_entry_safe(node, tmp, &buffer_queue.pages, list) {
+        list_del(&node->list);
+        __free_page(node->page);
+        kfree(node);
+    }
+    spin_unlock_irqrestore(&buffer_queue.lock, flags);
+
     free_irq(dummy_irq, NULL);
     tasklet_kill(&my_tasklet);
     device_destroy(asgn2_class, dev_num);
@@ -417,7 +442,9 @@ static void __exit asgn2_exit_module(void) {
     cdev_del(asgn2_cdev);
     unregister_chrdev_region(dev_num, 1);
     gpio_dummy_exit();
+    printk(KERN_INFO "asgn2: Module unloaded\n");
 }
+
 
 module_init(asgn2_init_module);
 module_exit(asgn2_exit_module);
