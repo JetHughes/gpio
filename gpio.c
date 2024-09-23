@@ -16,7 +16,7 @@
  * as published by the Free Software Foundation; either version
  * 2 of the License, or (at your option) any later version.
  */
-
+// #include "gpio.h"
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/gpio.h>
@@ -24,9 +24,9 @@
 #include <linux/version.h>
 #include <linux/delay.h>
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3, 3, 0)
-        #include <asm/switch_to.h>
+#include <asm/switch_to.h>
 #else
-        #include <asm/system.h>
+#include <asm/system.h>
 #endif
 
 #define BCM2835_PERI_BASE 0x3f000000
@@ -38,131 +38,143 @@ static u32 gpio_dummy_base;
  * The pin numbers are attained from "cat /sys/kernel/debug/gpio"
  * */
 static struct gpio gpio_dummy[] = {
-                { 519, GPIOF_IN, "GPIO7" },
-                { 520, GPIOF_OUT_INIT_HIGH, "GPIO8" },
-                { 529, GPIOF_IN, "GPIO17" },
-                { 530, GPIOF_OUT_INIT_HIGH, "GPIO18" },
-                { 534, GPIOF_IN, "GPIO22" },
-                { 535, GPIOF_OUT_INIT_HIGH, "GPIO23" },
-                { 536, GPIOF_IN, "GPIO24" },
-                { 537, GPIOF_OUT_INIT_HIGH, "GPIO25" },
-                { 516, GPIOF_OUT_INIT_LOW, "GPIO4" },
-                { 539, GPIOF_IN, "GPIO27" },
+	{ 519, GPIOF_IN, "GPIO7" },
+	{ 520, GPIOF_OUT_INIT_HIGH, "GPIO8" },
+	{ 529, GPIOF_IN, "GPIO17" },
+	{ 530, GPIOF_OUT_INIT_HIGH, "GPIO18" },
+	{ 534, GPIOF_IN, "GPIO22" },
+	{ 535, GPIOF_OUT_INIT_HIGH, "GPIO23" },
+	{ 536, GPIOF_IN, "GPIO24" },
+	{ 537, GPIOF_OUT_INIT_HIGH, "GPIO25" },
+	{ 516, GPIOF_OUT_INIT_LOW, "GPIO4" },
+	{ 539, GPIOF_IN, "GPIO27" },
 };
 static int dummy_irq;
 extern irqreturn_t dummyport_interrupt(int irq, void *dev_id);
 
-static inline u32
+	static inline u32
 gpio_inw(u32 addr)
 {
-    u32 data;
+	u32 data;
 
-    asm volatile("ldr %0,[%1]" : "=r"(data) : "r"(addr));
-    return data;
+	asm volatile("ldr %0,[%1]" : "=r"(data) : "r"(addr));
+	return data;
 }
 
-static inline void
+	static inline void
 gpio_outw(u32 addr, u32 data)
 {
-    asm volatile("str %1,[%0]" : : "r"(addr), "r"(data));
+	asm volatile("str %1,[%0]" : : "r"(addr), "r"(data));
 }
 
 void setgpiofunc(u32 func, u32 alt)
 {
-        u32 sel, data, shift;
+	u32 sel, data, shift;
 
-        if(func > 53) return;
-        sel = 0;
-        while (func > 10) {
-            func = func - 10;
-            sel++;
-        }
+	if(func > 53) return;
+	sel = 0;
+	while (func > 10) {
+		func = func - 10;
+		sel++;
+	}
 	sel = (sel << 2) + gpio_dummy_base;
-        data = gpio_inw(sel);
-        shift = func + (func << 1);
-        data &= ~(7 << shift);
-        data |= alt << shift;
-        gpio_outw(sel, data);
+	data = gpio_inw(sel);
+	shift = func + (func << 1);
+	data &= ~(7 << shift);
+	data |= alt << shift;
+	gpio_outw(sel, data);
 }
 
+/* 
+We use 10 GPIO pins in our second assignment. They work in 5 pairs. Four 
+pairs are used for data transmission of 4 bits (half-byte). Each pair has 
+one GPIO pin as input and the other one as output, where the output pin is 
+connected to the input pin. I will provide the following function for you 
+to read the half-byte from the four input pins.
+*/
 u8 read_half_byte(void)
 {
-u32 c;
-u8 r;
+	u32 c;
+	u8 r;
 
-r = 0;
-c = gpio_inw(gpio_dummy_base + 0x34);
-if (c & (1 << 7)) r |= 1;
-if (c & (1 << 17)) r |= 2;
-if (c & (1 << 22)) r |= 4;
-if (c & (1 << 24)) r |= 8;
+	r = 0;
+	c = gpio_inw(gpio_dummy_base + 0x34);
+	if (c & (1 << 7)) r |= 1;
+	if (c & (1 << 17)) r |= 2;
+	if (c & (1 << 22)) r |= 4;
+	if (c & (1 << 24)) r |= 8;
 
-return r;
+	return r;
 }
 
 static void write_to_gpio(char c)
 {
-volatile unsigned *gpio_set, *gpio_clear;
+	volatile unsigned *gpio_set, *gpio_clear;
 
-gpio_set = (unsigned *)((char *)gpio_dummy_base + 0x1c);
-gpio_clear = (unsigned *)((char *)gpio_dummy_base + 0x28);
+	gpio_set = (unsigned *)((char *)gpio_dummy_base + 0x1c);
+	gpio_clear = (unsigned *)((char *)gpio_dummy_base + 0x28);
 
-if(c & 1) *gpio_set = 1 << 8;
-else *gpio_clear = 1 << 8;
-udelay(1);
+	if(c & 1) *gpio_set = 1 << 8;
+	else *gpio_clear = 1 << 8;
+	udelay(1);
 
-if(c & 2) *gpio_set = 1 << 18;
-else *gpio_clear = 1 << 18;
-udelay(1);
+	if(c & 2) *gpio_set = 1 << 18;
+	else *gpio_clear = 1 << 18;
+	udelay(1);
 
-if(c & 4) *gpio_set = 1 << 23;
-else *gpio_clear = 1 << 23;
-udelay(1);
+	if(c & 4) *gpio_set = 1 << 23;
+	else *gpio_clear = 1 << 23;
+	udelay(1);
 
-if(c & 8) *gpio_set = 1 << 25;
-else *gpio_clear = 1 << 25;
-udelay(1);
+	if(c & 8) *gpio_set = 1 << 25;
+	else *gpio_clear = 1 << 25;
+	udelay(1);
 
 }
 
+/*The fifth pair is used for interrupt. The input and output pins are connected. The vitual dummy device uses the output pin to
+  send an interrupt signal to the input pin which triggers an IRQ to the CPU. The following functions are used to bring up and tear
+  down the GPIO-based dummy device.
+  */
 int gpio_dummy_init(void)
 {
-    int ret;
+	int ret;
 
-    gpio_dummy_base = (u32)ioremap(BCM2835_PERI_BASE + 0x200000, 4096);
-    printk(KERN_WARNING "The gpio base is mapped to %x\n", gpio_dummy_base);
-    ret = gpio_request_array(gpio_dummy, ARRAY_SIZE(gpio_dummy));
+	gpio_dummy_base = (u32)ioremap(BCM2835_PERI_BASE + 0x200000, 4096);
+	printk(KERN_WARNING "The gpio base is mapped to %x\n", gpio_dummy_base);
+	ret = gpio_request_array(gpio_dummy, ARRAY_SIZE(gpio_dummy));
 
-    if (ret) {
-	printk(KERN_ERR "Unable to request GPIOs for the dummy device: %d\n", ret);
-	return ret;
-        }
-    ret = gpio_to_irq(gpio_dummy[ARRAY_SIZE(gpio_dummy)-1].gpio);
-    if(ret < 0) {
-	printk(KERN_ERR "Unable to request IRQ for gpio %d: %d\n", gpio_dummy[ARRAY_SIZE(gpio_dummy)-1].gpio, ret);
-        goto fail1;
-    }
-    dummy_irq = ret;
-    printk(KERN_WARNING "Successfully requested IRQ# %d for %s\n", dummy_irq, gpio_dummy[ARRAY_SIZE(gpio_dummy)-1].label);
+	if (ret) {
+		printk(KERN_ERR "Unable to request GPIOs for the dummy device: %d\n", ret);
+		return ret;
+	}
+	ret = gpio_to_irq(gpio_dummy[ARRAY_SIZE(gpio_dummy)-1].gpio);
+	if(ret < 0) {
+		printk(KERN_ERR "Unable to request IRQ for gpio %d: %d\n", gpio_dummy[ARRAY_SIZE(gpio_dummy)-1].gpio, ret);
+		goto fail1;
+	}
+	dummy_irq = ret;
+	printk(KERN_INFO "Successfully requested IRQ# %d for %s\n", dummy_irq, gpio_dummy[ARRAY_SIZE(gpio_dummy)-1].label);
 
-    ret = request_irq(dummy_irq, dummyport_interrupt, IRQF_TRIGGER_RISING | IRQF_ONESHOT, "gpio27", NULL);
+	ret = request_irq(dummy_irq, dummyport_interrupt, IRQF_TRIGGER_RISING | IRQF_ONESHOT, "gpio27", NULL);
 
-    if(ret) {
-	printk(KERN_ERR "Unable to request IRQ for dummy device: %d\n", ret);
-	goto fail1;
-    }
-    write_to_gpio(15);
-return 0;
+	if(ret) {
+		printk(KERN_ERR "Unable to request IRQ for dummy device: %d\n", ret);
+		goto fail1;
+	}
+	write_to_gpio(15);
+	return 0;
 
 fail1:
-    gpio_free_array(gpio_dummy, ARRAY_SIZE(gpio_dummy));
-    iounmap((void *)gpio_dummy_base);
-    return ret;
+	gpio_free_array(gpio_dummy, ARRAY_SIZE(gpio_dummy));
+	iounmap((void *)gpio_dummy_base);
+	return ret;
 }
 
 void gpio_dummy_exit(void)
 {
-    free_irq(dummy_irq, NULL);
-    gpio_free_array(gpio_dummy, ARRAY_SIZE(gpio_dummy));
-    iounmap((void *)gpio_dummy_base);
+	free_irq(dummy_irq, NULL);
+	gpio_free_array(gpio_dummy, ARRAY_SIZE(gpio_dummy));
+	iounmap((void *)gpio_dummy_base);
+	printk(KERN_INFO "Goodbye from gpio");
 }

@@ -36,3 +36,5 @@ else
     echo -e "\nDevice $DEVICE does not exist. Did the module create it?"
     do_exit
 fi
+
+sudo ./data_generator test.txt

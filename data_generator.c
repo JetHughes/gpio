@@ -100,7 +100,8 @@ void setup_io()
 
 } // setup_io
 
-
+/*The following main() function reads from a text file and writes to the virtual port (the output pins) half-byte by half-byte. The
+final byte of zero indicates the end of a file.*/
 int main(int argc, char **argv) {
   FILE *in;
   size_t size_read;
