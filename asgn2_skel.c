@@ -15,19 +15,11 @@
 #include "gpio.c"
 
 #define MYDEV_NAME "asgn2"
-#define PAGE_QUEUE_SIZE 16
 #define CIRCULAR_BUFFER_SIZE 1024
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jet Hughes");
 MODULE_DESCRIPTION("COSC440 asgn2");
-
-struct page_node {
-    struct page *page;
-    size_t head_offset; // Read offset
-    size_t tail_offset; // Write offset
-    struct list_head list; // Kernel's linked list structure
-};
 
 /**
  * Circular buffer structure
@@ -38,8 +30,17 @@ struct circ_buffer {
     int tail;
     spinlock_t lock;
 };
-
 struct circ_buffer circ_buf;
+
+/**
+ * Page Node Structure
+ */
+struct page_node {
+    struct page *page;
+    size_t head_offset; // Read offset
+    size_t tail_offset; // Write offset
+    struct list_head list;
+};
 
 /**
  * Page queue structure (for multiple-page buffering)
@@ -49,8 +50,8 @@ typedef struct page_queue_t {
     spinlock_t lock; // Lock for the queue
     int data_size;
 } page_queue;
-
 page_queue buffer_queue;
+
 struct tasklet_struct my_tasklet;
 
 dev_t dev_num;
@@ -60,8 +61,9 @@ struct device *asgn2_device;
 
 spinlock_t queue_lock;
 wait_queue_head_t read_queue;
-static bool session_complete = false;
 atomic_t nprocs;
+
+static bool session_complete = false;
 
 /**
  * Initialize the circular buffer
@@ -87,6 +89,7 @@ void init_page_queue(void) {
 
 /**
  * Write a byte to the circular buffer
+ * Protected by spinlock
  */
 int circ_buf_write(char data) {
     unsigned long flags;
@@ -108,6 +111,7 @@ int circ_buf_write(char data) {
 
 /**
  * Read a byte from the circular buffer
+ * Protected by spinlock
  */
 int circ_buf_read(char *data) {
     unsigned long flags;
@@ -126,12 +130,16 @@ int circ_buf_read(char *data) {
     return 0;
 }
 
+/**
+ * Add a new page to the page queue. 
+ */
 struct page_node* alloc_new_page_node(void) {
     struct page_node *new_node = kmalloc(sizeof(*new_node), GFP_KERNEL);
     if (!new_node) {
         printk(KERN_ERR "Failed to allocate memory for page node\n");
         return NULL;
     }
+    memset(new_node, 0, sizeof(page_node));
 
     new_node->page = alloc_page(GFP_KERNEL);
     if (!new_node->page) {
@@ -144,12 +152,15 @@ struct page_node* alloc_new_page_node(void) {
     new_node->tail_offset = 0;
     INIT_LIST_HEAD(&new_node->list);
 
+    list_add_tail(&new_node->list, &buffer_queue.pages);
     return new_node;
 }
 
 
 /**
- * Add a byte to the page queue (used by the tasklet)
+ * Add a byte to the page queue (used by the tasklet). Allocates a new page 
+ * if the current page is full or if the page queue is empty.
+ * Protected by spinlock
  */
 void add_to_page_queue(char byte) {
     unsigned long flags;
@@ -157,28 +168,23 @@ void add_to_page_queue(char byte) {
 
     spin_lock_irqsave(&buffer_queue.lock, flags);
 
-    // Check if the list is empty or the last node's page is full
+    // Allocate a new page if the list is empty or the current page is full
     if (list_empty(&buffer_queue.pages)) {
-        // List is empty, allocate a new node
         tail_node = alloc_new_page_node();
         if (!tail_node) {
             spin_unlock_irqrestore(&buffer_queue.lock, flags);
             return;
         }
-        list_add_tail(&tail_node->list, &buffer_queue.pages);
     } else {
-        // Get the last node in the list
         tail_node = list_last_entry(&buffer_queue.pages, struct page_node, list);
         
-        // Check if the current page is full
+        // Allocate a new node if the current page is full
         if (tail_node->tail_offset >= PAGE_SIZE) {
-            // Allocate a new node since the current page is full
             tail_node = alloc_new_page_node();
             if (!tail_node) {
                 spin_unlock_irqrestore(&buffer_queue.lock, flags);
                 return;
             }
-            list_add_tail(&tail_node->list, &buffer_queue.pages);
         }
     }
 
@@ -238,7 +244,8 @@ irqreturn_t dummyport_interrupt(int irq, void *dev_id) {
 }
 
 /**
- * Read function: Consume data from the page queue
+ * Read function: Consume data from the page queue.
+ * Free pages that are fully read.
  */
 ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
     unsigned long flags;
@@ -283,23 +290,25 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count, loff_t *f_
                 break;
             }
         }
+        
+        ssize_t bytes_copied = to_read - copy_to_user(buf + bytes_read, page_addr + node->head_offset, to_read);
+        bytes_read += bytes_copied;
 
-        if (copy_to_user(buf + bytes_read, page_addr + node->head_offset, to_read)) {
+        if (bytes_copied < to_read) {
+            // Partial copy, some bytes could not be copied
             spin_unlock_irqrestore(&buffer_queue.lock, flags);
-            printk(KERN_ERR "asgn2: Failed to copy data to user space\n");
-            return -EFAULT;
+            printk(KERN_ERR "asgn2: Failed to copy all data to user space, %zu bytes copied\n", bytes_read);
+            return bytes_read;  // Return the number of bytes successfully copied
         }
 
         buffer_queue.data_size -= session_complete ? to_read+1 : to_read;
         node->head_offset += session_complete ? to_read+1 : to_read;
-        bytes_read += to_read;
 
         if (node->head_offset >= node->tail_offset) {
-            // We've read all data from this node or session is complete
+            // We've read all data from this page node
             printk(KERN_INFO "read all data, freeing page");
             list_del(&node->list);
             __free_page(node->page);
-            buffer_queue.data_size -= PAGE_SIZE;
             kfree(node);
         }
 
@@ -369,7 +378,7 @@ static int __init asgn2_init_module(void) {
     result = alloc_chrdev_region(&dev_num, 0, 1, MYDEV_NAME);
     if (result < 0) {
         printk(KERN_ERR "asgn2: Failed to allocate device number\n");
-        return result;
+        goto fail_chrdev;
     }
     printk(KERN_INFO "asgn2: Device number allocated\n");
 
@@ -380,7 +389,7 @@ static int __init asgn2_init_module(void) {
     result = cdev_add(asgn2_cdev, dev_num, 1);
     if (result) {
         printk(KERN_ERR "asgn2: Failed to add cdev\n");
-        goto fail_chrdev;
+        goto fail_cdev;
     }
 
     // Create device class and device node
@@ -388,14 +397,14 @@ static int __init asgn2_init_module(void) {
     if (IS_ERR(asgn2_class)) {
         result = PTR_ERR(asgn2_class);
         printk(KERN_ERR "asgn2: Failed to create device class\n");
-        goto fail_cdev;
+        goto fail_class;
     }
 
     asgn2_device = device_create(asgn2_class, NULL, dev_num, NULL, MYDEV_NAME);
     if (IS_ERR(asgn2_device)) {
         result = PTR_ERR(asgn2_device);
         printk(KERN_ERR "asgn2: Failed to create device node\n");
-        goto fail_class;
+        goto fail_device;
     }
 
     // Initialize tasklet
@@ -407,14 +416,14 @@ static int __init asgn2_init_module(void) {
     printk(KERN_INFO "asgn2: Module loaded\n");
     return 0;
 
-// fail_device:
-//     device_destroy(asgn2_class, dev_num);
-fail_class:
+fail_device:
     class_destroy(asgn2_class);
-fail_cdev:
+fail_class:
     cdev_del(asgn2_cdev);
-fail_chrdev:
+fail_cdev:
     unregister_chrdev_region(dev_num, 1);
+fail_chrdev:
+    gpio_dummy_exit();
     return result;
 }
 
@@ -435,7 +444,6 @@ static void __exit asgn2_exit_module(void) {
     }
     spin_unlock_irqrestore(&buffer_queue.lock, flags);
 
-    free_irq(dummy_irq, NULL);
     tasklet_kill(&my_tasklet);
     device_destroy(asgn2_class, dev_num);
     class_destroy(asgn2_class);
