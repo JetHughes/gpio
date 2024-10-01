@@ -139,7 +139,7 @@ struct page_node* alloc_new_page_node(void) {
         printk(KERN_ERR "Failed to allocate memory for page node\n");
         return NULL;
     }
-    memset(new_node, 0, sizeof(page_node));
+    memset(new_node, 0, sizeof(struct page_node));
 
     new_node->page = alloc_page(GFP_KERNEL);
     if (!new_node->page) {
